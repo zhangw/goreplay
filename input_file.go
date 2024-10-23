@@ -238,6 +238,16 @@ func NewFileInput(path string, loop bool, readDepth int, maxWait time.Duration, 
 	return
 }
 
+func parseS3Url(path string) (bucket, key string) {
+	path = path[5:] // stripping `s3://`
+	sep := strings.IndexByte(path, '/')
+
+	bucket = path[:sep]
+	key = path[sep+1:]
+
+	return bucket, key
+}
+
 func (i *FileInput) init() (err error) {
 	defer i.mu.Unlock()
 	i.mu.Lock()

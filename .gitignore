@@ -11,9 +11,11 @@ vendor
 hey
 
 *.bin
-
+lib/
+output/
 *.gz
 *.zip
+.aider*
 
 *.class
 

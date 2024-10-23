@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/tls"
 	"fmt"
-	"github.com/buger/goreplay/internal/size"
 	"log"
 	"math"
 	"net/http"
@@ -13,6 +12,8 @@ import (
 	"net/url"
 	"sync/atomic"
 	"time"
+
+	"github.com/buger/goreplay/internal/size"
 )
 
 const (
@@ -30,38 +31,44 @@ type response struct {
 
 // HTTPOutputConfig struct for holding http output configuration
 type HTTPOutputConfig struct {
-	TrackResponses bool          `json:"output-http-track-response"`
-	Stats          bool          `json:"output-http-stats"`
-	OriginalHost   bool          `json:"output-http-original-host"`
-	RedirectLimit  int           `json:"output-http-redirect-limit"`
-	WorkersMin     int           `json:"output-http-workers-min"`
-	WorkersMax     int           `json:"output-http-workers"`
-	StatsMs        int           `json:"output-http-stats-ms"`
-	QueueLen       int           `json:"output-http-queue-len"`
-	ElasticSearch  string        `json:"output-http-elasticsearch"`
-	Timeout        time.Duration `json:"output-http-timeout"`
-	WorkerTimeout  time.Duration `json:"output-http-worker-timeout"`
-	BufferSize     size.Size     `json:"output-http-response-buffer"`
-	SkipVerify     bool          `json:"output-http-skip-verify"`
-	rawURL         string
-	url            *url.URL
+	TrackResponses    bool          `json:"output-http-track-response"`
+	Stats             bool          `json:"output-http-stats"`
+	OriginalHost      bool          `json:"output-http-original-host"`
+	RedirectLimit     int           `json:"output-http-redirect-limit"`
+	WorkersMin        int           `json:"output-http-workers-min"`
+	WorkersMax        int           `json:"output-http-workers"`
+	StatsMs           int           `json:"output-http-stats-ms"`
+	QueueLen          int           `json:"output-http-queue-len"`
+	ElasticSearch     string        `json:"output-http-elasticsearch"`
+	Timeout           time.Duration `json:"output-http-timeout"`
+	WorkerTimeout     time.Duration `json:"output-http-worker-timeout"`
+	BufferSize        size.Size     `json:"output-http-response-buffer"`
+	SkipVerify        bool          `json:"output-http-skip-verify"`
+	CompatibilityMode bool          `json:"output-http-compatibility-mode"`
+	RequestGroup      string        `json:"output-http-request-group"`
+	Debug             bool          `json:"output-http-debug"`
+	rawURL            string
+	url               *url.URL
 }
 
 func (hoc *HTTPOutputConfig) Copy() *HTTPOutputConfig {
 	return &HTTPOutputConfig{
-		TrackResponses: hoc.TrackResponses,
-		Stats:          hoc.Stats,
-		OriginalHost:   hoc.OriginalHost,
-		RedirectLimit:  hoc.RedirectLimit,
-		WorkersMin:     hoc.WorkersMin,
-		WorkersMax:     hoc.WorkersMax,
-		StatsMs:        hoc.StatsMs,
-		QueueLen:       hoc.QueueLen,
-		ElasticSearch:  hoc.ElasticSearch,
-		Timeout:        hoc.Timeout,
-		WorkerTimeout:  hoc.WorkerTimeout,
-		BufferSize:     hoc.BufferSize,
-		SkipVerify:     hoc.SkipVerify,
+		TrackResponses:    hoc.TrackResponses,
+		Stats:             hoc.Stats,
+		OriginalHost:      hoc.OriginalHost,
+		RedirectLimit:     hoc.RedirectLimit,
+		WorkersMin:        hoc.WorkersMin,
+		WorkersMax:        hoc.WorkersMax,
+		StatsMs:           hoc.StatsMs,
+		QueueLen:          hoc.QueueLen,
+		ElasticSearch:     hoc.ElasticSearch,
+		Timeout:           hoc.Timeout,
+		WorkerTimeout:     hoc.WorkerTimeout,
+		BufferSize:        hoc.BufferSize,
+		SkipVerify:        hoc.SkipVerify,
+		CompatibilityMode: hoc.CompatibilityMode,
+		RequestGroup:      hoc.RequestGroup,
+		Debug:             hoc.Debug,
 	}
 }
 
@@ -69,15 +76,49 @@ func (hoc *HTTPOutputConfig) Copy() *HTTPOutputConfig {
 // By default workers pool is dynamic and starts with 1 worker or workerMin workers
 // You can specify maximum number of workers using `--output-http-workers`
 type HTTPOutput struct {
-	activeWorkers int32
-	config        *HTTPOutputConfig
-	queueStats    *GorStat
-	elasticSearch *ESPlugin
-	client        *HTTPClient
-	stopWorker    chan struct{}
-	queue         chan *Message
-	responses     chan *response
-	stop          chan bool // Channel used only to indicate goroutine should shutdown
+	activeWorkers  int64
+	config         *HTTPOutputConfig
+	queueStats     *GorStat
+	elasticSearch  *ESPlugin
+	client         *HTTPClient
+	stopWorker     chan struct{}
+	queue          chan *Message
+	responses      chan *response
+	stop           chan bool // Channel used only to indicate goroutine should shutdown
+	workerSessions map[string]*httpWorker
+}
+
+type httpWorker struct {
+	output       *HTTPOutput
+	client       *HTTPClient
+	lastActivity time.Time
+	queue        chan []byte
+	stop         chan bool
+}
+
+func newHTTPWorker(output *HTTPOutput, queue chan []byte) *httpWorker {
+	client := NewHTTPClient(output.config)
+
+	w := &httpWorker{client: client, output: output}
+	if queue == nil {
+		w.queue = make(chan []byte, 100)
+	} else {
+		w.queue = queue
+	}
+	w.stop = make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case payload := <-w.queue:
+				output.sendRequest(client, payload)
+			case <-w.stop:
+				return
+			}
+		}
+	}()
+
+	return w
 }
 
 // NewHTTPOutput constructor for HTTPOutput
@@ -139,11 +180,18 @@ func NewHTTPOutput(address string, config *HTTPOutputConfig) PluginReadWriter {
 		o.elasticSearch.Init(o.config.ElasticSearch)
 	}
 	o.client = NewHTTPClient(o.config)
-	o.activeWorkers += int32(o.config.WorkersMin)
-	for i := 0; i < o.config.WorkersMin; i++ {
-		go o.startWorker()
+
+	if Settings.RecognizeTCPSessions {
+		o.workerSessions = make(map[string]*httpWorker, 100)
+		go o.sessionWorkerMaster()
+	} else {
+		o.activeWorkers += int64(o.config.WorkersMin)
+		for i := 0; i < o.config.WorkersMin; i++ {
+			go o.startWorker()
+		}
+		go o.workerMaster()
 	}
-	go o.workerMaster()
+
 	return o
 }
 
@@ -164,13 +212,45 @@ func (o *HTTPOutput) workerMaster() {
 		}
 		// rollback workers
 	rollback:
-		if atomic.LoadInt32(&o.activeWorkers) > int32(o.config.WorkersMin) && len(o.queue) < 1 {
+		if atomic.LoadInt64(&o.activeWorkers) > int64(o.config.WorkersMin) && len(o.queue) < 1 {
 			// close one worker
 			o.stopWorker <- struct{}{}
-			atomic.AddInt32(&o.activeWorkers, -1)
+			atomic.AddInt64(&o.activeWorkers, -1)
 			goto rollback
 		}
 		timer.Reset(o.config.WorkerTimeout)
+	}
+}
+
+func (o *HTTPOutput) sessionWorkerMaster() {
+	gc := time.Tick(time.Second)
+
+	for {
+		select {
+		case msg := <-o.queue:
+			id := payloadID(msg.Meta)
+			sessionID := string(id[0:20])
+			worker, ok := o.workerSessions[sessionID]
+
+			if !ok {
+				atomic.AddInt64(&o.activeWorkers, 1)
+				worker = newHTTPWorker(o, nil)
+				o.workerSessions[sessionID] = worker
+			}
+
+			worker.queue <- msg.Data
+			worker.lastActivity = time.Now()
+		case <-gc:
+			now := time.Now()
+
+			for id, w := range o.workerSessions {
+				if !w.lastActivity.IsZero() && now.Sub(w.lastActivity) >= 120*time.Second {
+					w.stop <- true
+					delete(o.workerSessions, id)
+					atomic.AddInt64(&o.activeWorkers, -1)
+				}
+			}
+		}
 	}
 }
 
@@ -180,7 +260,7 @@ func (o *HTTPOutput) startWorker() {
 		case <-o.stopWorker:
 			return
 		case msg := <-o.queue:
-			o.sendRequest(o.client, msg)
+			o.sendRequest(o.client, msg.Data)
 		}
 	}
 }
@@ -200,13 +280,25 @@ func (o *HTTPOutput) PluginWrite(msg *Message) (n int, err error) {
 	if o.config.Stats {
 		o.queueStats.Write(len(o.queue))
 	}
-	if len(o.queue) > 0 {
-		// try to start a new worker to serve
-		if atomic.LoadInt32(&o.activeWorkers) < int32(o.config.WorkersMax) {
-			go o.startWorker()
-			atomic.AddInt32(&o.activeWorkers, 1)
+
+	if !Settings.RecognizeTCPSessions && o.config.WorkersMax != o.config.WorkersMin {
+		workersCount := int(atomic.LoadInt64(&o.activeWorkers))
+
+		if len(o.queue) > workersCount {
+			extraWorkersReq := len(o.queue) - workersCount + 1
+			maxWorkersAvailable := o.config.WorkersMax - workersCount
+			if extraWorkersReq > maxWorkersAvailable {
+				extraWorkersReq = maxWorkersAvailable
+			}
+			if extraWorkersReq > 0 {
+				for i := 0; i < extraWorkersReq; i++ {
+					go o.startWorker()
+					atomic.AddInt64(&o.activeWorkers, 1)
+				}
+			}
 		}
 	}
+
 	return len(msg.Data) + len(msg.Meta), nil
 }
 
@@ -229,14 +321,14 @@ func (o *HTTPOutput) PluginRead() (*Message, error) {
 	return &msg, nil
 }
 
-func (o *HTTPOutput) sendRequest(client *HTTPClient, msg *Message) {
-	if !isRequestPayload(msg.Meta) {
+func (o *HTTPOutput) sendRequest(client *HTTPClient, data []byte) {
+	if !isRequestPayload(data) {
 		return
 	}
 
-	uuid := payloadID(msg.Meta)
+	uuid := payloadID(data)
 	start := time.Now()
-	resp, err := client.Send(msg.Data)
+	resp, err := client.Send(data)
 	stop := time.Now()
 
 	if err != nil {
@@ -252,7 +344,7 @@ func (o *HTTPOutput) sendRequest(client *HTTPClient, msg *Message) {
 	}
 
 	if o.elasticSearch != nil {
-		o.elasticSearch.ResponseAnalyze(msg.Data, resp, start, stop)
+		o.elasticSearch.ResponseAnalyze(data, resp, start, stop)
 	}
 }
 
