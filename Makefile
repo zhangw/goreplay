@@ -29,7 +29,10 @@ vendor:
 	go mod vendor
 
 release-bin: vendor
-	docker run --rm -v `pwd`:$(SOURCE_PATH) -t --env GOOS=linux --env GOARCH=amd64  -i $(CONTAINER) go build -mod=vendor -o $(BIN_NAME) -tags netgo $(LDFLAGS)
+	docker run --rm -v `pwd`:$(SOURCE_PATH) -t --env GOOS=linux --env GOARCH=amd64 -i $(CONTAINER) sh -c 'git config --global --add safe.directory /go/src/github.com/buger/goreplay && go build -mod=vendor -o $(BIN_NAME) -tags netgo $(LDFLAGS)'
+
+dbg-bin: vendor
+	docker run --rm -v `pwd`:$(SOURCE_PATH) -t --env GOOS=linux --env GOARCH=amd64 -i $(CONTAINER) sh -c 'git config --global --add safe.directory /go/src/github.com/buger/goreplay && go build -mod=vendor -o $(BIN_NAME)-dbg -tags netgo -gcflags "all=-N -l" $(LDFLAGS)'
 
 release-bin-x64: vendor
 	docker run --rm -v `pwd`:$(SOURCE_PATH) -t --env GOOS=linux --env GOARCH=386 -i $(CONTAINER) go build -mod=vendor -o $(BIN_NAME) -tags netgo $(LDFLAGS)

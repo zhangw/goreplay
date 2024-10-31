@@ -21,6 +21,7 @@ hey
 .idea
 *.iml
 gor
+gor-dbg
 
 *.mprof
 
